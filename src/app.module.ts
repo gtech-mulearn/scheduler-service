@@ -18,11 +18,11 @@ import { SchedulerModule } from './scheduler/scheduler.module';
         if (dbType === 'mysql') {
           return {
             type: 'mysql' as const,
-            host: config.get<string>('DB_HOST', 'localhost'),
-            port: parseInt(config.get<string>('DB_PORT', '3306'), 10),
-            username: config.get<string>('DB_USER', 'root'),
-            password: config.get<string>('DB_PASSWORD', ''),
-            database: config.get<string>('DB_NAME', 'scheduler'),
+            host: config.get<string>('DATABASE_HOST', 'localhost'),
+            port: parseInt(config.get<string>('DATABASE_PORT', '3306'), 10),
+            username: config.get<string>('DATABASE_USER', 'root'),
+            password: config.get<string>('DATABASE_PASSWORD', ''),
+            database: config.get<string>('DATABASE_NAME', 'scheduler'),
             entities,
             synchronize: config.get<string>('DB_SYNC', 'false') === 'true',
             logging: config.get<string>('DB_LOGGING', 'false') === 'true',
