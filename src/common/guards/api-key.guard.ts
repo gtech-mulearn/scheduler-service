@@ -25,7 +25,9 @@ export class ApiKeyGuard implements CanActivate {
       throw new UnauthorizedException('Invalid Authorization header format');
     }
 
-    const apiKey = this.configService.get<string>('API_KEY');
+    const apiKey =
+      this.configService.get<string>('SCHEDULER_SERVICE_API_KEY') ||
+      this.configService.get<string>('API_KEY');
 
     if (token !== apiKey) {
       throw new UnauthorizedException('Invalid API Key');
