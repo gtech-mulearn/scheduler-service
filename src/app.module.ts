@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { APP_GUARD } from '@nestjs/core';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { TypeOrmModule } from '@nestjs/typeorm';
-import { SchedulerModule } from './scheduler/scheduler.module';
-import { APP_GUARD } from '@nestjs/core';
-import { ApiKeyGuard } from './guards/api-key.guard';
+import { ApiKeyGuard } from './common/guards/api-key.guard';
+import { JobsModule } from './modules/jobs/jobs.module';
+import { GritMeterModule } from './modules/grit-meter/grit-meter.module';
 
 @Module({
   imports: [
@@ -14,11 +15,12 @@ import { ApiKeyGuard } from './guards/api-key.guard';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
-        const dbType = config.get<string>('DB_TYPE');
+        const dbEngine = config.get<string>('DATABASE_ENGINE') || config.get<string>('DB_TYPE') || 'mysql';
+        const isMysql = dbEngine.includes('mysql') || dbEngine.includes('mariadb');
         const entities = [__dirname + '/**/*.entity{.ts,.js}'];
 
-        if (dbType !== 'mysql') {
-          throw new Error('Only MySQL database is supported. Please check DB_TYPE in .env');
+        if (!isMysql) {
+          throw new Error(`Unsupported database engine "${dbEngine}". Please check DATABASE_ENGINE / DB_TYPE in .env`);
         }
 
         return {
@@ -27,14 +29,15 @@ import { ApiKeyGuard } from './guards/api-key.guard';
           port: parseInt(config.get<string>('DATABASE_PORT', '3306'), 10),
           username: config.get<string>('DATABASE_USER', 'root'),
           password: config.get<string>('DATABASE_PASSWORD', ''),
-          database: config.get<string>('DATABASE_NAME', 'scheduler'),
+          database: config.get<string>('DATABASE_NAME', 'mulearn'),
           entities,
           synchronize: config.get<string>('DB_SYNC', 'false') === 'true',
           logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         };
       },
     }),
-    SchedulerModule,
+    JobsModule,
+    GritMeterModule,
   ],
   controllers: [AppController],
   providers: [
@@ -45,4 +48,4 @@ import { ApiKeyGuard } from './guards/api-key.guard';
     },
   ],
 })
-export class AppModule { }
+export class AppModule {}
