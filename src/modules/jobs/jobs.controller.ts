@@ -1,10 +1,10 @@
 import { Body, Controller, Get, Post, Delete, Param, HttpCode } from '@nestjs/common';
 import { CreateJobDto } from './dto/create-job.dto';
-import { SchedulerService } from './scheduler.service';
+import { JobsService } from './jobs.service';
 
 @Controller('jobs')
-export class SchedulerController {
-  constructor(private readonly svc: SchedulerService) {}
+export class JobsController {
+  constructor(private readonly svc: JobsService) {}
 
   @Post()
   async create(@Body() payload: CreateJobDto) {
