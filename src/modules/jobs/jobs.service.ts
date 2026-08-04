@@ -6,8 +6,8 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { JobRunnerService } from './job-runner.service';
 
 @Injectable()
-export class SchedulerService {
-  private readonly logger = new Logger(SchedulerService.name);
+export class JobsService {
+  private readonly logger = new Logger(JobsService.name);
 
   constructor(
     @InjectRepository(JobEntity)
@@ -31,7 +31,6 @@ export class SchedulerService {
     });
 
     const saved = await this.repo.save(entity);
-    // immediately schedule the created job in the background runner
     try {
       await this.runner.scheduleNewJob(saved);
     } catch (err) {
@@ -68,14 +67,12 @@ export class SchedulerService {
   }
 
   async removeAll(): Promise<void> {
-    // ask runner to unschedule all timers/cron tasks first
     try {
       await this.runner.unscheduleAll();
     } catch (err) {
       this.logger.warn('Error unscheduling all jobs in runner: ' + String(err));
     }
 
-    // delete all job rows
     await this.repo.clear();
     this.logger.log('All jobs removed from persistence');
   }
