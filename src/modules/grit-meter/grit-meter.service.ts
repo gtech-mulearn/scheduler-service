@@ -34,7 +34,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   }
 
   async processDailyGritMeter(): Promise<{ processed: number; levelDowns: number }> {
-    this.logger.log('Starting Daily Grit Meter / HP Processing');
+    this.logger.log('Starting Daily Grit Meter');
 
     const isEnabled = await this.checkFeatureFlag();
     if (!isEnabled) {
@@ -49,95 +49,106 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
     let levelDownCount = 0;
 
     try {
-      const userLinks: Array<{
-        id: string;
-        user_id: string;
-        level_id: string;
-        grit: number;
-        level_order: number;
-      }> = await queryRunner.query(`
-        SELECT 
-          ull.id,
-          ull.user_id,
-          ull.level_id,
-          COALESCE(ull.grit, 50) AS grit,
-          l.level_order
-        FROM user_lvl_link ull
-        JOIN level l ON ull.level_id = l.id
-      `);
-
-      this.logger.log(`Found ${userLinks.length} user level records to process`);
-
       const webhookUrl = this.configService.get<string>('DISCORD_WEBHOOK_LINK');
 
-      for (const link of userLinks) {
-        const activityResult: Array<{ activity_count: number }> = await queryRunner.query(
-          `
-          SELECT COUNT(*) AS activity_count
+      // 1. Bulk increment grit (+1, max 100) for active Level 5+ users
+      const activeUpdateResult = await queryRunner.query(`
+        UPDATE user_lvl_link ull
+        JOIN level l ON ull.level_id = l.id
+        JOIN (
+          SELECT DISTINCT user_id
           FROM karma_activity_log
-          WHERE user_id = ?
-            AND created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+          WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
             AND created_at < CURDATE()
-          `,
-          [link.user_id],
-        );
+        ) active ON ull.user_id = active.user_id
+        SET ull.grit = LEAST(100, COALESCE(ull.grit, 50) + 1),
+            ull.updated_at = NOW()
+        WHERE l.level_order >= 5
+      `);
 
-        const hasActivity = (activityResult[0]?.activity_count ?? 0) > 0;
-        let newGrit = hasActivity ? Math.min(100, link.grit + 1) : link.grit - 1;
+      // 2. Identify Level 5+ inactive users whose grit is <= 1 (they hit 0 after today's -1 decrement)
+      const levelDownCandidates: Array<{
+        id: string;
+        user_id: string;
+        level_order: number;
+      }> = await queryRunner.query(`
+        SELECT ull.id, ull.user_id, l.level_order
+        FROM user_lvl_link ull
+        JOIN level l ON ull.level_id = l.id
+        LEFT JOIN (
+          SELECT DISTINCT user_id
+          FROM karma_activity_log
+          WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            AND created_at < CURDATE()
+        ) active ON ull.user_id = active.user_id
+        WHERE l.level_order >= 5
+          AND active.user_id IS NULL
+          AND COALESCE(ull.grit, 50) <= 1
+      `);
 
-        if (newGrit <= 0) {
-          if (link.level_order >= 5) {
-            const targetLevelOrder = link.level_order - 1;
-            const targetLevel: Array<{ id: string }> = await queryRunner.query(
-              `SELECT id FROM level WHERE level_order = ? LIMIT 1`,
-              [targetLevelOrder],
-            );
+      // 3. Bulk decrement grit (-1) for remaining inactive Level 5+ users (whose grit > 1)
+      const inactiveUpdateResult = await queryRunner.query(`
+        UPDATE user_lvl_link ull
+        JOIN level l ON ull.level_id = l.id
+        LEFT JOIN (
+          SELECT DISTINCT user_id
+          FROM karma_activity_log
+          WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            AND created_at < CURDATE()
+        ) active ON ull.user_id = active.user_id
+        SET ull.grit = ull.grit - 1,
+            ull.updated_at = NOW()
+        WHERE l.level_order >= 5
+          AND active.user_id IS NULL
+          AND COALESCE(ull.grit, 50) > 1
+      `);
 
-            if (targetLevel.length > 0) {
-              const lowerLevelId = targetLevel[0].id;
-              newGrit = 100;
+      // Cache all levels to avoid querying level table per user
+      const levels: Array<{ id: string; level_order: number }> = await queryRunner.query(
+        `SELECT id, level_order FROM level`,
+      );
+      const levelOrderToIdMap = new Map<number, string>(
+        levels.map((lvl) => [Number(lvl.level_order), lvl.id]),
+      );
 
-              await queryRunner.query(
-                `
-                UPDATE user_lvl_link
-                SET level_id = ?,
-                    grit = ?,
-                    last_level_down_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = ?
-                `,
-                [lowerLevelId, newGrit, link.id],
-              );
+      for (const link of levelDownCandidates) {
+        const targetLevelOrder = link.level_order - 1;
+        const lowerLevelId = levelOrderToIdMap.get(targetLevelOrder);
 
-              levelDownCount++;
-              this.logger.log(
-                `User ${link.user_id} leveled down: Level ${link.level_order} -> Level ${targetLevelOrder}. Grit reset to 100%.`,
-              );
+        if (lowerLevelId) {
+          await queryRunner.query(
+            `
+            UPDATE user_lvl_link
+            SET level_id = ?,
+                grit = 100,
+                last_level_down_at = NOW(),
+                updated_at = NOW()
+            WHERE id = ?
+            `,
+            [lowerLevelId, link.id],
+          );
 
-              if (webhookUrl) {
-                await this.sendDiscordWebhook(webhookUrl, link.user_id);
-              }
-            } else {
-              await queryRunner.query(
-                `UPDATE user_lvl_link SET grit = 0, updated_at = NOW() WHERE id = ?`,
-                [link.id],
-              );
-            }
-          } else {
-            await queryRunner.query(
-              `UPDATE user_lvl_link SET grit = 0, updated_at = NOW() WHERE id = ?`,
-              [link.id],
-            );
+          levelDownCount++;
+          this.logger.log(
+            `User ${link.user_id} leveled down: Level ${link.level_order} -> Level ${targetLevelOrder}. Grit reset to 100%.`,
+          );
+
+          if (webhookUrl) {
+            await this.sendDiscordWebhook(webhookUrl, link.user_id);
           }
         } else {
           await queryRunner.query(
-            `UPDATE user_lvl_link SET grit = ?, updated_at = NOW() WHERE id = ?`,
-            [newGrit, link.id],
+            `UPDATE user_lvl_link SET grit = 0, updated_at = NOW() WHERE id = ?`,
+            [link.id],
           );
         }
-
-        processedCount++;
       }
+
+      const activeCount = activeUpdateResult?.affectedRows ?? activeUpdateResult?.info ?? 0;
+      const inactiveCount = inactiveUpdateResult?.affectedRows ?? inactiveUpdateResult?.info ?? 0;
+      processedCount = (typeof activeCount === 'number' ? activeCount : 0) +
+                       (typeof inactiveCount === 'number' ? inactiveCount : 0) +
+                       levelDownCandidates.length;
 
       this.logger.log(
         `Daily Grit Meter processing complete. Processed: ${processedCount}, Level Downs: ${levelDownCount}`,
