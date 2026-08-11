@@ -25,4 +25,4 @@ jobs:
         REMOTE_IP: ${{ secrets.PROD_REMOTE_IP }}
         PROJECT_PATH: ${{ secrets.PROJECT_PATH }}
       run: |
-        ssh -o StrictHostKeyChecking=no ubuntu@$REMOTE_IP "cd $PROJECT_PATH && git checkout production && git pull origin production && docker rmi mulearn-scheduler-service || true && docker images --filter 'dangling=true' --filter 'reference=mulearn-scheduler-service*' -q | xargs -r docker rmi || true && docker-compose build --no-cache && docker-compose up -d"
+        ssh -o StrictHostKeyChecking=no ubuntu@$REMOTE_IP "cd $PROJECT_PATH && docker image prune -f && git pull && docker-compose up --build -d"
