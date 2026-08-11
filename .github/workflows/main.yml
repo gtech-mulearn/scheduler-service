@@ -2,7 +2,7 @@ name: Prod CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "production" ]
   workflow_dispatch:
 
 jobs:
