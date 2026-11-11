@@ -7,6 +7,7 @@ import { AppService } from './app.service';
 import { ApiKeyGuard } from './common/guards/api-key.guard';
 import { JobsModule } from './modules/jobs/jobs.module';
 import { GritMeterModule } from './modules/grit-meter/grit-meter.module';
+import { MailerModule } from './modules/mailer/mailer.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { GritMeterModule } from './modules/grit-meter/grit-meter.module';
     }),
     JobsModule,
     GritMeterModule,
+    MailerModule,
   ],
   controllers: [AppController],
   providers: [

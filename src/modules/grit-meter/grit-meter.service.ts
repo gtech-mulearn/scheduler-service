@@ -1,8 +1,21 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, QueryRunner } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import axios from 'axios';
 import * as cron from 'node-cron';
+import { MailerService } from '../mailer/mailer.service';
+import {
+  getGritWarningTemplate,
+  getLevelDownTemplate,
+} from './grit-meter-email.templates';
+
+interface LevelDownUserRecord {
+  userId: string;
+  previousLevelOrder: number;
+  newLevelOrder: number;
+  newLevelName: string;
+}
 
 @Injectable()
 export class GritMeterService implements OnModuleInit, OnModuleDestroy {
@@ -12,6 +25,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly dataSource: DataSource,
     private readonly configService: ConfigService,
+    private readonly mailerService: MailerService,
   ) {}
 
   onModuleInit() {
@@ -47,6 +61,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
 
     let processedCount = 0;
     let levelDownCount = 0;
+    const demotedUsers: LevelDownUserRecord[] = [];
 
     try {
       const webhookUrl = this.configService.get<string>('DISCORD_WEBHOOK_LINK');
@@ -104,16 +119,20 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
       `);
 
       // Cache all levels to avoid querying level table per user
-      const levels: Array<{ id: string; level_order: number }> = await queryRunner.query(
-        `SELECT id, level_order FROM level`,
+      const levels: Array<{ id: string; level_order: number; name: string }> = await queryRunner.query(
+        `SELECT id, level_order, name FROM level`,
       );
       const levelOrderToIdMap = new Map<number, string>(
         levels.map((lvl) => [Number(lvl.level_order), lvl.id]),
+      );
+      const levelOrderToNameMap = new Map<number, string>(
+        levels.map((lvl) => [Number(lvl.level_order), lvl.name]),
       );
 
       for (const link of levelDownCandidates) {
         const targetLevelOrder = link.level_order - 1;
         const lowerLevelId = levelOrderToIdMap.get(targetLevelOrder);
+        const lowerLevelName = levelOrderToNameMap.get(targetLevelOrder) || `Level ${targetLevelOrder}`;
 
         if (lowerLevelId) {
           await queryRunner.query(
@@ -129,6 +148,13 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
           );
 
           levelDownCount++;
+          demotedUsers.push({
+            userId: link.user_id,
+            previousLevelOrder: link.level_order,
+            newLevelOrder: targetLevelOrder,
+            newLevelName: lowerLevelName,
+          });
+
           this.logger.log(
             `User ${link.user_id} leveled down: Level ${link.level_order} -> Level ${targetLevelOrder}. Grit reset to 100%.`,
           );
@@ -153,6 +179,9 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(
         `Daily Grit Meter processing complete. Processed: ${processedCount}, Level Downs: ${levelDownCount}`,
       );
+
+      // 4. Send Email Notifications (Level Downs & Milestone Warnings)
+      await this.processGritNotifications(queryRunner, demotedUsers);
     } catch (err) {
       this.logger.error('Failed processing daily grit meter', err);
       throw err;
@@ -161,6 +190,185 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
     }
 
     return { processed: processedCount, levelDowns: levelDownCount };
+  }
+
+  /**
+   * Dispatches Level-Down notices and Grit Warning Milestone emails (50, 20, 5, 1).
+   * Prevents duplicates using notification_log dedupe keys.
+   */
+  private async processGritNotifications(
+    queryRunner: QueryRunner,
+    demotedUsers: LevelDownUserRecord[],
+  ): Promise<void> {
+    try {
+      // 1. Dispatch Level Down emails
+      for (const demoted of demotedUsers) {
+        await this.sendDemotionNotification(queryRunner, demoted);
+      }
+
+      // 2. Dispatch Milestone Warning emails (1, 5, 20, 50)
+      const milestones = [
+        { milestone: 1, type: 'GRIT_1', min: 1, max: 1 },
+        { milestone: 5, type: 'GRIT_5', min: 2, max: 5 },
+        { milestone: 20, type: 'GRIT_20', min: 6, max: 20 },
+        { milestone: 50, type: 'GRIT_50', min: 21, max: 50 },
+      ];
+
+      for (const m of milestones) {
+        await this.sendMilestoneWarnings(queryRunner, m);
+      }
+    } catch (err: any) {
+      this.logger.error(`Error processing grit email notifications: ${err.message}`, err.stack);
+    }
+  }
+
+  private async sendDemotionNotification(
+    queryRunner: QueryRunner,
+    record: LevelDownUserRecord,
+  ): Promise<void> {
+    try {
+      const users: Array<{ email: string; first_name: string }> = await queryRunner.query(
+        `SELECT email, first_name FROM user WHERE id = ? LIMIT 1`,
+        [record.userId],
+      );
+
+      if (!users || users.length === 0 || !users[0].email) {
+        return;
+      }
+
+      const user = users[0];
+      const template = getLevelDownTemplate({
+        firstName: user.first_name || 'Learner',
+        previousLevelOrder: record.previousLevelOrder,
+        newLevelOrder: record.newLevelOrder,
+        newLevelName: record.newLevelName,
+      });
+
+      const todayStr = new Date().toISOString().split('T')[0];
+      const dedupeKey = `LEVEL_DOWN:${record.userId}:${todayStr}`;
+
+      const sendResult = await this.mailerService.sendMail({
+        to: user.email,
+        subject: template.subject,
+        html: template.html,
+        text: template.text,
+      });
+
+      await queryRunner.query(
+        `
+        INSERT INTO notification_log 
+          (id, user_id, type, channel, dedupe_key, recipient, status, metadata, error_message, sent_at)
+        VALUES (?, ?, 'LEVEL_DOWN', 'EMAIL', ?, ?, ?, ?, ?, NOW())
+        ON DUPLICATE KEY UPDATE status = VALUES(status), sent_at = NOW()
+        `,
+        [
+          randomUUID(),
+          record.userId,
+          dedupeKey,
+          user.email,
+          sendResult.success ? 'sent' : 'failed',
+          JSON.stringify({
+            previousLevel: record.previousLevelOrder,
+            newLevel: record.newLevelOrder,
+          }),
+          sendResult.error || null,
+        ],
+      );
+    } catch (err: any) {
+      this.logger.error(`Failed sending demotion email to user ${record.userId}: ${err.message}`);
+    }
+  }
+
+  private async sendMilestoneWarnings(
+    queryRunner: QueryRunner,
+    m: { milestone: number; type: string; min: number; max: number },
+  ): Promise<void> {
+    try {
+      const candidates: Array<{
+        user_id: string;
+        email: string;
+        first_name: string;
+        level_order: number;
+        level_name: string;
+        grit: number;
+        cycle_id: string;
+      }> = await queryRunner.query(
+        `
+        SELECT 
+          ull.user_id,
+          u.email,
+          u.first_name,
+          l.level_order,
+          l.name AS level_name,
+          ull.grit,
+          COALESCE(DATE_FORMAT(ull.last_level_down_at, '%Y%m%d%H%i%s'), 'initial') AS cycle_id
+        FROM user_lvl_link ull
+        JOIN user u ON ull.user_id = u.id
+        JOIN level l ON ull.level_id = l.id
+        LEFT JOIN (
+          SELECT DISTINCT user_id
+          FROM karma_activity_log
+          WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            AND created_at < CURDATE()
+        ) active ON ull.user_id = active.user_id
+        LEFT JOIN notification_log nl
+          ON nl.user_id = ull.user_id
+         AND nl.dedupe_key = CONCAT(?, ':', ull.user_id, ':', COALESCE(DATE_FORMAT(ull.last_level_down_at, '%Y%m%d%H%i%s'), 'initial'))
+        WHERE l.level_order >= 5
+          AND active.user_id IS NULL
+          AND ull.grit >= ? AND ull.grit <= ?
+          AND nl.id IS NULL
+          AND u.email IS NOT NULL AND u.email != ''
+        LIMIT 500
+        `,
+        [m.type, m.min, m.max],
+      );
+
+      if (!candidates || candidates.length === 0) {
+        return;
+      }
+
+      this.logger.log(`Found ${candidates.length} candidate(s) for milestone ${m.type}`);
+
+      for (const candidate of candidates) {
+        const template = getGritWarningTemplate({
+          firstName: candidate.first_name || 'Learner',
+          grit: candidate.grit,
+          levelOrder: candidate.level_order,
+          levelName: candidate.level_name,
+        });
+
+        const dedupeKey = `${m.type}:${candidate.user_id}:${candidate.cycle_id}`;
+
+        const sendResult = await this.mailerService.sendMail({
+          to: candidate.email,
+          subject: template.subject,
+          html: template.html,
+          text: template.text,
+        });
+
+        await queryRunner.query(
+          `
+          INSERT INTO notification_log 
+            (id, user_id, type, channel, dedupe_key, recipient, status, metadata, error_message, sent_at)
+          VALUES (?, ?, ?, 'EMAIL', ?, ?, ?, ?, ?, NOW())
+          ON DUPLICATE KEY UPDATE status = VALUES(status), sent_at = NOW()
+          `,
+          [
+            randomUUID(),
+            candidate.user_id,
+            m.type,
+            dedupeKey,
+            candidate.email,
+            sendResult.success ? 'sent' : 'failed',
+            JSON.stringify({ grit: candidate.grit, level: candidate.level_order }),
+            sendResult.error || null,
+          ],
+        );
+      }
+    } catch (err: any) {
+      this.logger.error(`Error sending milestone warnings for ${m.type}: ${err.message}`);
+    }
   }
 
   private async checkFeatureFlag(): Promise<boolean> {
