@@ -227,8 +227,8 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
     record: LevelDownUserRecord,
   ): Promise<void> {
     try {
-      const users: Array<{ email: string; first_name: string }> = await queryRunner.query(
-        `SELECT email, first_name FROM user WHERE id = ? LIMIT 1`,
+      const users: Array<{ email: string; full_name: string }> = await queryRunner.query(
+        `SELECT email, full_name FROM user WHERE id = ? LIMIT 1`,
         [record.userId],
       );
 
@@ -238,7 +238,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
 
       const user = users[0];
       const template = getLevelDownTemplate({
-        firstName: user.first_name || 'Learner',
+        firstName: user.full_name || 'Learner',
         previousLevelOrder: record.previousLevelOrder,
         newLevelOrder: record.newLevelOrder,
         newLevelName: record.newLevelName,
@@ -287,7 +287,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
       const candidates: Array<{
         user_id: string;
         email: string;
-        first_name: string;
+        full_name: string;
         level_order: number;
         level_name: string;
         grit: number;
@@ -297,7 +297,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
         SELECT 
           ull.user_id,
           u.email,
-          u.first_name,
+          u.full_name,
           l.level_order,
           l.name AS level_name,
           ull.grit,
@@ -332,7 +332,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
 
       for (const candidate of candidates) {
         const template = getGritWarningTemplate({
-          firstName: candidate.first_name || 'Learner',
+          firstName: candidate.full_name || 'Learner',
           grit: candidate.grit,
           levelOrder: candidate.level_order,
           levelName: candidate.level_name,
@@ -374,7 +374,7 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   private async checkFeatureFlag(): Promise<boolean> {
     try {
       const result: Array<{ value: string }> = await this.dataSource.query(
-        `SELECT value FROM system_setting WHERE key = 'grit_meter_enabled' LIMIT 1`,
+        `SELECT value FROM system_setting WHERE \`key\` = 'grit_meter_enabled' LIMIT 1`,
       );
       if (!result || result.length === 0) {
         return true;
