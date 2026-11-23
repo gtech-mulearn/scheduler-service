@@ -13,9 +13,16 @@ interface FakeOptions {
   switchRows?: Array<{ value: string }> | Error;
   candidates?: Candidate[];
   failLogInsert?: boolean;
+  failRollback?: boolean;
   sendResult?: { success: boolean; error?: string };
   webhook?: string;
+  milestoneCandidates?: Array<Record<string, unknown>>;
 }
+
+// The guarded level-down, as the service must write it: the four placeholders are, in order, the
+// lower level, the new last_level_down_at, the link id and the start of the IST day.
+const GUARDED_UPDATE =
+  /^UPDATE user_lvl_link SET level_id = \?, grit = 100, last_level_down_at = \?, updated_at = NOW\(\) WHERE id = \? AND \(last_level_down_at IS NULL OR last_level_down_at < \?\)$/;
 
 function setUp(options: FakeOptions = {}) {
   const events: string[] = [];
@@ -44,7 +51,9 @@ function setUp(options: FakeOptions = {}) {
       }));
     }
     if (/^UPDATE user_lvl_link SET level_id/.test(s)) {
-      // Emulates the guard: lower the learner unless already lowered on this IST day.
+      // Emulates the guard, after checking the SQL has the shape the parameters assume.
+      if (!GUARDED_UPDATE.test(s))
+        throw new Error(`unexpected level-down SQL: ${s}`);
       const [, , linkId, dayStart] = params as [string, string, string, string];
       const last = levelDownAt.get(linkId);
       if (last && last >= dayStart) return { affectedRows: 0 };
@@ -65,7 +74,13 @@ function setUp(options: FakeOptions = {}) {
       });
       return { affectedRows: 1 };
     }
-    if (/^UPDATE notification_log SET status/.test(s)) {
+    if (/FROM user_lvl_link ull JOIN user u/.test(s)) {
+      return params[0] === 'GRIT_1' ? (options.milestoneCandidates ?? []) : [];
+    }
+    if (
+      /^INSERT INTO notification_log/.test(s) === false &&
+      /^UPDATE notification_log SET status/.test(s)
+    ) {
       const row = notificationLog.find((r) => r.dedupe === params[3]);
       if (row) {
         row.status = String(params[0]);
@@ -81,7 +96,10 @@ function setUp(options: FakeOptions = {}) {
     release: jest.fn(async () => undefined),
     startTransaction: jest.fn(async () => void events.push('START')),
     commitTransaction: jest.fn(async () => void events.push('COMMIT')),
-    rollbackTransaction: jest.fn(async () => void events.push('ROLLBACK')),
+    rollbackTransaction: jest.fn(async () => {
+      events.push('ROLLBACK');
+      if (options.failRollback) throw new Error('rollback failed');
+    }),
     query: jest.fn(async (sql: string, params?: unknown[]) => {
       const s = sql.replace(/\s+/g, ' ').trim();
       events.push(`Q ${s.slice(0, 40)}`);
@@ -310,5 +328,73 @@ describe('lowering a learner', () => {
       },
     ]);
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('user-1'));
+  });
+});
+
+describe('robustness', () => {
+  const second: Candidate = { id: 'link-2', user_id: 'user-2', level_order: 6 };
+
+  it('emails each lowered learner right after its own commit', async () => {
+    const { service, events } = setUp({ candidates: [learner, second] });
+
+    await service.processDailyGritMeter();
+
+    const secondStart = events.lastIndexOf('START');
+    expect(events.indexOf('MAIL user-1@example.test')).toBeGreaterThan(
+      events.indexOf('COMMIT'),
+    );
+    expect(events.indexOf('MAIL user-1@example.test')).toBeLessThan(
+      secondStart,
+    );
+  });
+
+  it('aborts the run when a rollback fails, instead of carrying on inside a broken transaction', async () => {
+    const { service, queryRunner, mailerService } = setUp({
+      candidates: [learner, second],
+      failLogInsert: true,
+      failRollback: true,
+    });
+
+    await expect(service.processDailyGritMeter()).rejects.toThrow(
+      'rollback failed',
+    );
+
+    expect(queryRunner.startTransaction).toHaveBeenCalledTimes(1);
+    expect(mailerService.sendMail).not.toHaveBeenCalled();
+    expect(queryRunner.release).toHaveBeenCalled();
+  });
+
+  it('names the dedupe key by the IST date, which can differ from the UTC one', async () => {
+    jest.setSystemTime(new Date('2026-11-22T20:00:00Z')); // 01:30 IST on 23 Nov
+    const { service, notificationLog } = setUp({ candidates: [learner] });
+
+    await service.processDailyGritMeter();
+
+    expect(notificationLog.map((row) => row.dedupe)).toEqual([
+      'LEVEL_DOWN:user-1:2026-11-23',
+    ]);
+  });
+
+  it('logs a failed milestone warning', async () => {
+    const { service } = setUp({
+      sendResult: { success: false, error: 'smtp down' },
+      milestoneCandidates: [
+        {
+          user_id: 'user-9',
+          email: 'nine@example.test',
+          full_name: 'Nine',
+          level_order: 6,
+          level_name: 'Level 6',
+          grit: 1,
+          cycle_id: 'initial',
+        },
+      ],
+    });
+
+    await service.processDailyGritMeter();
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('GRIT_1 email to user user-9 failed'),
+    );
   });
 });

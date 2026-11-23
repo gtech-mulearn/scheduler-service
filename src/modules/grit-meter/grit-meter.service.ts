@@ -92,7 +92,6 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
 
     let processedCount = 0;
     let levelDownCount = 0;
-    const demotedUsers: LevelDownUserRecord[] = [];
 
     try {
       const webhookUrl = this.configService.get<string>('DISCORD_WEBHOOK_LINK');
@@ -176,16 +175,17 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
           if (!demoted) continue;
 
           levelDownCount++;
-          demotedUsers.push(demoted);
 
           this.logger.log(
             `User ${link.user_id} leveled down: Level ${link.level_order} -> Level ${targetLevelOrder}. Grit reset to 100%.`,
           );
 
-          // Side effects only after the commit.
+          // Side effects only after the commit, and right after it: a later learner's failure
+          // can't leave this one's email unsent or its log row stuck at 'pending'.
           if (webhookUrl) {
             await this.sendDiscordWebhook(webhookUrl, link.user_id);
           }
+          await this.sendDemotionNotification(queryRunner, demoted);
         } else {
           await queryRunner.query(
             `UPDATE user_lvl_link SET grit = 0, updated_at = NOW() WHERE id = ?`,
@@ -204,8 +204,8 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
         `Daily Grit Meter processing complete. Processed: ${processedCount}, Level Downs: ${levelDownCount}`,
       );
 
-      // 4. Send Email Notifications (Level Downs & Milestone Warnings)
-      await this.processGritNotifications(queryRunner, demotedUsers);
+      // 4. Milestone warning emails (each level-down's email went out after its own commit).
+      await this.processGritNotifications(queryRunner);
     } catch (err) {
       this.logger.error('Failed processing daily grit meter', err);
       throw err;
@@ -217,20 +217,12 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Dispatches Level-Down notices and Grit Warning Milestone emails (50, 20, 5, 1).
+   * Dispatches Grit Warning Milestone emails (50, 20, 5, 1).
    * Prevents duplicates using notification_log dedupe keys.
    */
-  private async processGritNotifications(
-    queryRunner: QueryRunner,
-    demotedUsers: LevelDownUserRecord[],
-  ): Promise<void> {
+  private async processGritNotifications(queryRunner: QueryRunner): Promise<void> {
     try {
-      // 1. Dispatch Level Down emails
-      for (const demoted of demotedUsers) {
-        await this.sendDemotionNotification(queryRunner, demoted);
-      }
-
-      // 2. Dispatch Milestone Warning emails (1, 5, 20, 50)
+      // Dispatch Milestone Warning emails (1, 5, 20, 50)
       const milestones = [
         { milestone: 1, type: 'GRIT_1', min: 1, max: 1 },
         { milestone: 5, type: 'GRIT_5', min: 2, max: 5 },
@@ -297,7 +289,8 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
           INSERT INTO notification_log
             (id, user_id, type, channel, dedupe_key, recipient, status, metadata, error_message, sent_at)
           VALUES (?, ?, 'LEVEL_DOWN', 'EMAIL', ?, ?, 'pending', ?, NULL, NOW())
-          ON DUPLICATE KEY UPDATE status = 'pending', error_message = NULL, sent_at = NOW()
+          ON DUPLICATE KEY UPDATE status = 'pending', recipient = VALUES(recipient),
+            metadata = VALUES(metadata), error_message = NULL, sent_at = NOW()
           `,
           [
             randomUUID(),
@@ -312,7 +305,17 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
       await queryRunner.commitTransaction();
       return record;
     } catch (err: any) {
-      await queryRunner.rollbackTransaction().catch(() => undefined);
+      try {
+        await queryRunner.rollbackTransaction();
+      } catch (rollbackError) {
+        // The runner may now think a transaction is still open: carrying on would run later
+        // learners inside a savepoint of it. Stop the run instead.
+        this.logger.error(
+          `Rollback failed after leveling down user ${link.user_id} failed; stopping the run`,
+          rollbackError,
+        );
+        throw rollbackError;
+      }
       this.logger.error(`Failed leveling down user ${link.user_id}; rolled back: ${err?.message}`);
       return null;
     }
