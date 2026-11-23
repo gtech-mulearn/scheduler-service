@@ -10,11 +10,43 @@ import {
   getLevelDownTemplate,
 } from './grit-meter-email.templates';
 
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+/** A UTC instant as MySQL DATETIME text: 'YYYY-MM-DD HH:MM:SS'. */
+function toSqlUtc(date: Date): string {
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/** The IST calendar date of an instant, 'YYYY-MM-DD'. */
+export function istDay(now: Date): string {
+  return new Date(now.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * The start of the IST day containing `now`, in UTC as MySQL DATETIME text. The backend stores
+ * DATETIMEs in UTC (TIME_ZONE = "UTC", USE_TZ = True), so last_level_down_at compares against it.
+ */
+export function istDayStartUtc(now: Date): string {
+  const startIst = new Date(`${istDay(now)}T00:00:00Z`).getTime();
+  return toSqlUtc(new Date(startIst - IST_OFFSET_MS));
+}
+
 interface LevelDownUserRecord {
   userId: string;
   previousLevelOrder: number;
   newLevelOrder: number;
   newLevelName: string;
+  /** Read inside the level-down transaction; null when the user has no email. */
+  email: string | null;
+  fullName: string;
+  /** The notification_log row reserved for this level-down's email. */
+  dedupeKey: string;
+}
+
+/** Rows changed by an UPDATE (mysql2's result header, which TypeORM returns as-is). */
+function affectedRows(result: unknown): number {
+  const rows = (result as { affectedRows?: unknown } | null)?.affectedRows;
+  return typeof rows === 'number' ? rows : 0;
 }
 
 @Injectable()
@@ -50,9 +82,8 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   async processDailyGritMeter(): Promise<{ processed: number; levelDowns: number }> {
     this.logger.log('Starting Daily Grit Meter');
 
-    const isEnabled = await this.checkFeatureFlag();
-    if (!isEnabled) {
-      this.logger.warn('Grit Meter processing skipped: Feature flag "grit_meter_enabled" is OFF');
+    // Fails closed: a missing or unreadable switch skips the run (isEnabled logs why).
+    if (!(await this.isEnabled())) {
       return { processed: 0, levelDowns: 0 };
     }
 
@@ -61,7 +92,6 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
 
     let processedCount = 0;
     let levelDownCount = 0;
-    const demotedUsers: LevelDownUserRecord[] = [];
 
     try {
       const webhookUrl = this.configService.get<string>('DISCORD_WEBHOOK_LINK');
@@ -129,39 +159,33 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
         levels.map((lvl) => [Number(lvl.level_order), lvl.name]),
       );
 
+      const now = new Date();
       for (const link of levelDownCandidates) {
         const targetLevelOrder = link.level_order - 1;
         const lowerLevelId = levelOrderToIdMap.get(targetLevelOrder);
         const lowerLevelName = levelOrderToNameMap.get(targetLevelOrder) || `Level ${targetLevelOrder}`;
 
         if (lowerLevelId) {
-          await queryRunner.query(
-            `
-            UPDATE user_lvl_link
-            SET level_id = ?,
-                grit = 100,
-                last_level_down_at = NOW(),
-                updated_at = NOW()
-            WHERE id = ?
-            `,
-            [lowerLevelId, link.id],
-          );
+          const demoted = await this.lowerLearner(queryRunner, link, {
+            lowerLevelId,
+            targetLevelOrder,
+            lowerLevelName,
+            now,
+          });
+          if (!demoted) continue;
 
           levelDownCount++;
-          demotedUsers.push({
-            userId: link.user_id,
-            previousLevelOrder: link.level_order,
-            newLevelOrder: targetLevelOrder,
-            newLevelName: lowerLevelName,
-          });
 
           this.logger.log(
             `User ${link.user_id} leveled down: Level ${link.level_order} -> Level ${targetLevelOrder}. Grit reset to 100%.`,
           );
 
+          // Side effects only after the commit, and right after it: a later learner's failure
+          // can't leave this one's email unsent or its log row stuck at 'pending'.
           if (webhookUrl) {
             await this.sendDiscordWebhook(webhookUrl, link.user_id);
           }
+          await this.sendDemotionNotification(queryRunner, demoted);
         } else {
           await queryRunner.query(
             `UPDATE user_lvl_link SET grit = 0, updated_at = NOW() WHERE id = ?`,
@@ -180,8 +204,8 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
         `Daily Grit Meter processing complete. Processed: ${processedCount}, Level Downs: ${levelDownCount}`,
       );
 
-      // 4. Send Email Notifications (Level Downs & Milestone Warnings)
-      await this.processGritNotifications(queryRunner, demotedUsers);
+      // 4. Milestone warning emails (each level-down's email went out after its own commit).
+      await this.processGritNotifications(queryRunner);
     } catch (err) {
       this.logger.error('Failed processing daily grit meter', err);
       throw err;
@@ -193,20 +217,12 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Dispatches Level-Down notices and Grit Warning Milestone emails (50, 20, 5, 1).
+   * Dispatches Grit Warning Milestone emails (50, 20, 5, 1).
    * Prevents duplicates using notification_log dedupe keys.
    */
-  private async processGritNotifications(
-    queryRunner: QueryRunner,
-    demotedUsers: LevelDownUserRecord[],
-  ): Promise<void> {
+  private async processGritNotifications(queryRunner: QueryRunner): Promise<void> {
     try {
-      // 1. Dispatch Level Down emails
-      for (const demoted of demotedUsers) {
-        await this.sendDemotionNotification(queryRunner, demoted);
-      }
-
-      // 2. Dispatch Milestone Warning emails (1, 5, 20, 50)
+      // Dispatch Milestone Warning emails (1, 5, 20, 50)
       const milestones = [
         { milestone: 1, type: 'GRIT_1', min: 1, max: 1 },
         { milestone: 5, type: 'GRIT_5', min: 2, max: 5 },
@@ -222,57 +238,116 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Lowers one learner in its own transaction: the level update, guarded so a learner is lowered
+   * at most once per IST day, and the notification_log row reserved for the email. Returns null,
+   * with nothing changed, when the learner was already lowered today or the transaction fails.
+   */
+  private async lowerLearner(
+    queryRunner: QueryRunner,
+    link: { id: string; user_id: string; level_order: number },
+    target: { lowerLevelId: string; targetLevelOrder: number; lowerLevelName: string; now: Date },
+  ): Promise<LevelDownUserRecord | null> {
+    await queryRunner.startTransaction();
+    try {
+      const result = await queryRunner.query(
+        `
+        UPDATE user_lvl_link
+        SET level_id = ?,
+            grit = 100,
+            last_level_down_at = ?,
+            updated_at = NOW()
+        WHERE id = ?
+          AND (last_level_down_at IS NULL OR last_level_down_at < ?)
+        `,
+        [target.lowerLevelId, toSqlUtc(target.now), link.id, istDayStartUtc(target.now)],
+      );
+      if (affectedRows(result) === 0) {
+        await queryRunner.rollbackTransaction();
+        this.logger.log(`User ${link.user_id} was already leveled down today (IST); skipped.`);
+        return null;
+      }
+
+      const users: Array<{ email: string; full_name: string }> = await queryRunner.query(
+        `SELECT email, full_name FROM user WHERE id = ? LIMIT 1`,
+        [link.user_id],
+      );
+      const user = users?.[0];
+      const record: LevelDownUserRecord = {
+        userId: link.user_id,
+        previousLevelOrder: link.level_order,
+        newLevelOrder: target.targetLevelOrder,
+        newLevelName: target.lowerLevelName,
+        email: user?.email || null,
+        fullName: user?.full_name || 'Learner',
+        dedupeKey: `LEVEL_DOWN:${link.user_id}:${istDay(target.now)}`,
+      };
+
+      if (record.email) {
+        await queryRunner.query(
+          `
+          INSERT INTO notification_log
+            (id, user_id, type, channel, dedupe_key, recipient, status, metadata, error_message, sent_at)
+          VALUES (?, ?, 'LEVEL_DOWN', 'EMAIL', ?, ?, 'pending', ?, NULL, NOW())
+          ON DUPLICATE KEY UPDATE status = 'pending', recipient = VALUES(recipient),
+            metadata = VALUES(metadata), error_message = NULL, sent_at = NOW()
+          `,
+          [
+            randomUUID(),
+            record.userId,
+            record.dedupeKey,
+            record.email,
+            JSON.stringify({ previousLevel: record.previousLevelOrder, newLevel: record.newLevelOrder }),
+          ],
+        );
+      }
+
+      await queryRunner.commitTransaction();
+      return record;
+    } catch (err: any) {
+      try {
+        await queryRunner.rollbackTransaction();
+      } catch (rollbackError) {
+        // The runner may now think a transaction is still open: carrying on would run later
+        // learners inside a savepoint of it. Stop the run instead.
+        this.logger.error(
+          `Rollback failed after leveling down user ${link.user_id} failed; stopping the run`,
+          rollbackError,
+        );
+        throw rollbackError;
+      }
+      this.logger.error(`Failed leveling down user ${link.user_id}; rolled back: ${err?.message}`);
+      return null;
+    }
+  }
+
+  /** Sends a committed level-down's email and records the outcome on its reserved log row. */
   private async sendDemotionNotification(
     queryRunner: QueryRunner,
     record: LevelDownUserRecord,
   ): Promise<void> {
+    if (!record.email) return;
     try {
-      const users: Array<{ email: string; full_name: string }> = await queryRunner.query(
-        `SELECT email, full_name FROM user WHERE id = ? LIMIT 1`,
-        [record.userId],
-      );
-
-      if (!users || users.length === 0 || !users[0].email) {
-        return;
-      }
-
-      const user = users[0];
       const template = getLevelDownTemplate({
-        firstName: user.full_name || 'Learner',
+        firstName: record.fullName,
         previousLevelOrder: record.previousLevelOrder,
         newLevelOrder: record.newLevelOrder,
         newLevelName: record.newLevelName,
       });
 
-      const todayStr = new Date().toISOString().split('T')[0];
-      const dedupeKey = `LEVEL_DOWN:${record.userId}:${todayStr}`;
-
       const sendResult = await this.mailerService.sendMail({
-        to: user.email,
+        to: record.email,
         subject: template.subject,
         html: template.html,
         text: template.text,
       });
+      if (!sendResult.success) {
+        this.logger.error(`Level-down email to user ${record.userId} failed: ${sendResult.error}`);
+      }
 
       await queryRunner.query(
-        `
-        INSERT INTO notification_log 
-          (id, user_id, type, channel, dedupe_key, recipient, status, metadata, error_message, sent_at)
-        VALUES (?, ?, 'LEVEL_DOWN', 'EMAIL', ?, ?, ?, ?, ?, NOW())
-        ON DUPLICATE KEY UPDATE status = VALUES(status), sent_at = NOW()
-        `,
-        [
-          randomUUID(),
-          record.userId,
-          dedupeKey,
-          user.email,
-          sendResult.success ? 'sent' : 'failed',
-          JSON.stringify({
-            previousLevel: record.previousLevelOrder,
-            newLevel: record.newLevelOrder,
-          }),
-          sendResult.error || null,
-        ],
+        `UPDATE notification_log SET status = ?, error_message = ?, sent_at = NOW() WHERE user_id = ? AND dedupe_key = ?`,
+        [sendResult.success ? 'sent' : 'failed', sendResult.error || null, record.userId, record.dedupeKey],
       );
     } catch (err: any) {
       this.logger.error(`Failed sending demotion email to user ${record.userId}: ${err.message}`);
@@ -346,6 +421,9 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
           html: template.html,
           text: template.text,
         });
+        if (!sendResult.success) {
+          this.logger.error(`${m.type} email to user ${candidate.user_id} failed: ${sendResult.error}`);
+        }
 
         await queryRunner.query(
           `
@@ -371,18 +449,27 @@ export class GritMeterService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async checkFeatureFlag(): Promise<boolean> {
+  /**
+   * Reads the grit_meter_enabled switch and fails closed: a missing row or a failed read means
+   * the run is skipped, with an error logged. Only an explicit 'true' turns it on.
+   */
+  private async isEnabled(): Promise<boolean> {
     try {
       const result: Array<{ value: string }> = await this.dataSource.query(
         `SELECT value FROM system_setting WHERE \`key\` = 'grit_meter_enabled' LIMIT 1`,
       );
       if (!result || result.length === 0) {
-        return true;
+        this.logger.error('Grit Meter skipped: the "grit_meter_enabled" setting is missing (failing closed)');
+        return false;
       }
-      return result[0].value.toLowerCase() === 'true';
+      const enabled = String(result[0].value).toLowerCase() === 'true';
+      if (!enabled) {
+        this.logger.warn('Grit Meter processing skipped: Feature flag "grit_meter_enabled" is OFF');
+      }
+      return enabled;
     } catch (err) {
-      this.logger.warn('Failed to query feature flag, defaulting to true', err);
-      return true;
+      this.logger.error('Grit Meter skipped: could not read "grit_meter_enabled" (failing closed)', err);
+      return false;
     }
   }
 
